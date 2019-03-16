@@ -1,0 +1,9 @@
+loadPackages <- function(package0){
+  package1 <- package0[!(package0 %in% installed.packages()[, "Package"])]
+  if (length(package1))
+    install.packages(package1, dependencies = TRUE)
+  sapply(package0, require, character.only = TRUE)
+}
+
+Packages <- c("") 
+loadPackages(Packages)
