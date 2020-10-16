@@ -1,0 +1,13 @@
+library(purrr)
+library(readxl)
+
+files_list <- list.files(path = 'Data/raw_data/',
+                         pattern = "*.xlsx",
+                         full.names = TRUE)
+files_list %>% 
+  walk2(1:length(files_list),
+        ~ assign(paste0("df_", .y), 
+                 read_excel(path = .x),
+                 envir = globalenv()
+        )
+  )
