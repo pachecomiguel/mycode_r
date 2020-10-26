@@ -1,0 +1,923 @@
+# Data Extraction ---------------------------------------------------------
+# rm(list = ls())
+#Data extraction
+ipak <- function(pkg) {
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg))
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+# download libraries ------------------------------------------------------
+
+packages <-
+  c(
+    'tidyverse',
+    'rlang',
+    'xml2',
+    'data.table',
+    'tidytext',
+    'tm',
+    'quanteda',
+    'quanteda.textmodels',
+    'topicmodels',
+    'wordcloud',
+    'stm',
+    'lubridate',
+    'ngram',
+    'igraph',
+    'ggraph',
+    'caret'
+  )
+
+ipak(packages)
+
+# Data extraction via Itunes ----------------------------------------------
+
+#create vector with the various links to access
+list.urlnames <- vector()
+for (i in seq(9)) {
+  #9 equals to the number of pages available with xml code
+  list.urlnames[[i]] <-
+    sprintf(
+      'https://itunes.apple.com/gb/rss/customerreviews/id=1388411277/page=%s/xml',
+      i
+    )
+}
+
+
+#access links and extract reviews and associated data from each link
+df_list <- lapply(list.urlnames, function(f) {
+  doc <- read_xml(f) %>% xml_ns_strip() %>% xml_children()
+  setNames(
+    data.frame(
+      doc %>%  xml_find_all('//feed//entry/updated') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/id') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/title') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/im:contentType') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/im:voteSum') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/im:voteCount') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/im:rating') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/im:version') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry/author/name') %>% xml_text(),
+      doc %>%  xml_find_all('//feed//entry//content[@type="text"]') %>% xml_text()
+    ),
+    c(
+      'updated',
+      'id',
+      'title_',
+      'content_type',
+      'vote_sum',
+      'vote_count',
+      'rating',
+      'version',
+      'author_name',
+      'review_'
+    )
+  )
+})
+
+df <-
+  as_tibble(rbindlist(
+    lapply(df_list, as.data.frame.list),
+    fill = FALSE,
+    use.names = FALSE
+  ))
+
+
+# Data Cleaning -----------------------------------------------------------
+
+#change factors to numeric, character and date variables
+df0 <- df %>%  
+  select(-c(author_name, title_, content_type, id, vote_sum)) %>% 
+  mutate(author_id = as.double(1:n()),
+             app_store = 'itunes') %>%
+  mutate_at(vars(vote_count),
+            funs(as.double)) %>%
+  mutate_at(vars( review_),
+            funs(as.character)) %>%
+  mutate_at(vars(updated),
+            funs(as.Date)) %>%
+  mutate_at(vars( rating),
+            funs(as.factor)) #%>%
+  # mutate_if(is.character,
+  #           str_replace_all,
+  #           pattern = "â",
+  #           replacement = "'")
+# df0
+# itâs
+
+# Adding features -----------------------------------------------------
+# Connecting to script data_extraction -----------------------------------------------
+source('1_data_extraction_itunes.R')
+source('1_data_extraction_google.R')
+
+df1 <- bind_rows(pandas_df, df0) %>%
+  mutate_at(vars(app_store,version),funs(as.factor))
+
+
+df2 <-
+  df1 %>% 
+  mutate(author_id = as.factor(1:n())) %>%
+  add_column(
+    wordcount = strsplit(df1$review_, split = " ") %>% lengths(),
+    text_length = str_length(df1$review_),
+    text_readability = textstat_readability(df1$review_, measure = 'FOG')[[2]],
+    sentence_count = nsentence(df1$review_),
+    syllabes_count = nsyllable(df1$review_),
+    tokens_count = ntoken(char_tolower(df1$review_), remove_punct = TRUE)
+    # ,lexical_diversity = (tokens(df1$review_, remove_punct = TRUE) %>%
+    # textstat_lexdiv(measure = "S") %>% select(S) %>% replace(is.na(.),0))
+  ) %>% select(author_id, everything()) %>%
+  mutate_if(is.character,
+            str_replace_all,
+            pattern = "â",
+            replacement = "'")
+
+df2 
+
+
+# Preparing data for text mining ------------------------------------------
+data_set <- df2 %>% select(review_, author_id,rating)
+
+
+doc_corpus <- corpus(data_set, text_field = 'review_', 
+                     docid_field = 'author_id' )
+summary(doc_corpus)
+
+doc_dfm <- dfm(doc_corpus, 
+               remove_numbers = FALSE,
+               tolower = TRUE,
+               remove_punct = TRUE,
+               remove_url = FALSE,
+               stem = FALSE, 
+               remove = stop_words$word)
+
+# 1 - Tokenization ----------------------------------
+
+# doc_tokens <- tokens(doc_corpus)
+# doc_tokens_sentence <- tokens(doc_corpus, what = "sentence")
+doc_tokens_word <- tokens(doc_corpus, what = "word")
+
+doc_tokens_ngram <- tokens_ngrams(doc_tokens_word, n = 2:3, concatenator = " ")
+
+
+# 2 - Lemmanized ----------------------------------------------------------
+
+doc_dfm_stem <- dfm(doc_corpus, 
+               remove_numbers = FALSE,
+               remove_punct = TRUE,
+               stem = TRUE, 
+               remove = stop_words$word)
+
+# 3 - Word count ----------------------------------------------------------
+
+doc_dfm2 <- doc_dfm %>% dfm_trim( min_termfreq = 15 , min_docfreq = 30, max_docfreq = 'count')
+
+term_frequency_all <- textstat_frequency(doc_dfm2, groups = 'rating', ties_method = c( 'dense'))
+term_frequency_all
+
+
+term_frequency_all %>%
+  filter( frequency > 10) %>%
+  filter( !feature %in% c('app', 'nhs')) %>%
+  mutate(feature = factor(feature, levels = rev(unique(feature)))) %>%
+  group_by(group) %>%
+  top_n(3) %>%
+  ungroup() %>%
+  ggplot(aes(x = feature, y = frequency, fill = as.factor(group))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~group, ncol = 2, scales = "free") +
+  coord_flip()
+
+
+# 4 - Word Cloud ----------------------------------------------------------
+
+textplot_wordcloud(doc_dfm2,
+                   min_count = 3,
+                   max_words = 75,
+                   random_order = FALSE)
+
+
+# 5 - Collocations --------------------------------------------
+
+doc_tokens_word2 <- tokens(doc_corpus, 
+                          what = "word", 
+                          remove_punct = TRUE,
+                          remove_symbols = TRUE,
+                          remove_numbers = FALSE) %>% tokens_remove(stop_words$word)
+
+collocations_count <- textstat_collocations(doc_tokens_word2, 
+                                            size = 2:5,
+                                            min_count = 3)
+
+collocations_data2 <- collocations_count %>% 
+  select(collocation, count) %>% 
+  arrange(desc(count)) %>%
+  as_tibble()
+
+
+# Sentiment analysis ------------------------------------------------------
+#https://rpubs.com/mkivenson/sentiment-reviews
+
+# import data -------------------------------------------------------------
+df_sa <- df2
+
+# preview data ------------------------------------------------------------
+
+summary(df2)
+
+# word summary ------------------------------------------------------------
+
+words <- df2 %>% 
+  select(author_id, review_, rating) %>%
+  unnest_tokens(word, review_) %>%
+  filter(!word %in% stop_words$word , str_detect(word, "^[a-z']+$"))
+
+words
+
+# sentiment analysis with Afinn -------------------------------------------
+#Each word is ranked from -5 to 5, where 5 is the most positive rating while -5 is the most negative.
+
+afinn <- get_sentiments("afinn")
+
+reviews.afinn <- words %>%
+  inner_join(afinn, by = 'word')
+
+
+head(reviews.afinn)
+
+# most common words -------------------------------------------------------
+
+word_summary <- reviews.afinn %>%
+  group_by(word) %>%
+  summarise(mean_rating = mean(as.numeric(rating)), score = max(value), count_word = n()) %>%
+  arrange(desc(count_word)) 
+
+
+# most common words view --------------------------------------------------
+
+ggplot(filter(word_summary, count_word < 100 ), aes(mean_rating, score))+
+  geom_text(aes(label = word, color = count_word, size = count_word), position = position_jitter()) +
+  scale_color_gradient( low = 'lightblue', high = "darkblue") + 
+  coord_cartesian(xlim = c(3.5,4.5)) +
+  guides(size = FALSE, color = FALSE) +
+  theme_minimal()
+  
+
+# wordcloud:overview ------------------------------------------------------
+
+wordcloud(words = word_summary$word, freq = word_summary$count_word,
+          scale = c(5,.5), max.words = 300, colors = brewer.pal(8, 'Set2') )
+
+# common positive words ---------------------------------------------------
+
+good <- reviews.afinn %>%
+  group_by(word) %>%
+  summarise(mean_rating = mean(as.numeric(rating)), score = max(value), count_word = n()) %>%
+  # filter(mean_rating > mean(mean_rating)) %>%
+  filter(score > 1) %>%
+  arrange(desc(mean_rating))
+
+wordcloud(words = good$word, freq = good$count_word, scale = c(5,.5), 
+          max.words = 100, colors = brewer.pal(8, 'Set2'))
+
+# common negative words ---------------------------------------------------
+
+bad <- reviews.afinn %>%
+  group_by(word) %>%
+  summarise(mean_rating = mean(as.numeric(rating)), score = max(value), count_word = n()) %>%
+  filter(count_word > 1, score < 1) %>%
+  arrange(mean_rating)
+
+wordcloud(words = bad$word, freq = bad$count_word, scale = c(5,.5), 
+          max.words = 100, colors = brewer.pal(8, 'Set2'))
+            
+
+# reviews by product ------------------------------------------------------
+review_summary <- reviews.afinn %>%
+  group_by(author_id) %>%
+  summarise(mean_rating = mean(as.numeric(rating)), sentiment = mean(value))
+
+# visualizing product sentiment -------------------------------------------
+y_mid = 0
+x_mid = 3.5
+
+review_summary %>%
+  mutate(quadrand = case_when(mean_rating > x_mid & sentiment > y_mid ~
+                                'Positive Review/Positive Sentiment',
+                              mean_rating <= x_mid & sentiment > y_mid ~
+                                'Negative Review/Positive Sentiment',
+                              mean_rating <= x_mid & sentiment <= y_mid ~
+                                'Negative Review / Negative Sentiment', TRUE ~
+                                'Positive Review ? Negative Sentiment')) %>%
+  ggplot(aes(x= mean_rating, y = sentiment, color = quadrand)) +
+  geom_hline(yintercept = y_mid, color = 'black', size = .5) +
+  geom_vline(xintercept = x_mid, color = 'black', size = .5) +
+  guides(color = FALSE) +
+  scale_color_manual(values = c('lightgreen', 'pink', 'pink', 'lightgreen')) +
+  ggtitle('NHS Rating vs Sentiment Rating of Review') +
+  ggplot2::annotate("text", x = 4.33, y = 3.5,label = "Positive Review/Postive Sentiment") +
+  ggplot2::annotate("text", x = 2, y = 3.5, label = "Negative Review/Positive Sentiment") +
+  ggplot2::annotate("text", x = 4.33, y = -2.5, label = "Positive Review/Negative Sentiment") +
+  ggplot2::annotate("text", x = 2, y = -2.5, label = "Negative Review/Negative Sentiment") +
+  geom_point(position = 'jitter') +
+  theme_dark()
+
+
+# sentiment analysis time series ------------------------------------------
+
+df2 %>% 
+  select(updated, review_, rating) %>%
+  unnest_tokens(word, review_) %>%
+  filter(!word %in% stop_words$word , str_detect(word, "^[a-z']+$")) %>%
+  inner_join(get_sentiments('afinn'), by = 'word') %>%
+  filter(word == 'easy')
+  
+  
+# Applying algorithms -----------------------------------------------------
+# 1 Calculate the total words in each rating ----------------------------
+data_set <- df2 %>% select(author_id, rating, review_)
+
+reviews_words <- data_set %>%
+  unnest_tokens(word,review_) %>% 
+  count(rating, word, sort = TRUE)
+
+total_words <- reviews_words %>% group_by(rating) %>% summarize(total = sum(n))
+
+rating_words <- left_join(reviews_words, total_words) %>% 
+  anti_join(stop_words, by = c("word" = "word"))
+
+rating_words <- rating_words %>% filter(!word %in%  c('app', 'nhs', 'told', 'utter'))
+
+
+# 2 Term frequency ----------------------------------------------------------
+
+ggplot(rating_words, aes(n/total, fill = rating)) +
+  geom_histogram(show.legend = FALSE, bins = 15) +
+  # xlim(NA, 0.0009) +
+  facet_wrap(~rating, ncol = 2, scales = "free_y")
+
+
+# 3 Zipf's Law --------------------------------------------------------------
+#Zipf's Law states that the frequency that a word appears is inversely proportional to its rank
+
+freq_by_rank <- rating_words %>%
+  group_by(rating) %>%
+  mutate(rank = row_number(),
+         frequency_term = n/total)
+
+freq_by_rank
+
+freq_by_rank %>% 
+  ggplot(aes(rank, frequency_term, color = rating)) + 
+  geom_line(size = 1.1, show.legend = TRUE) + 
+  scale_x_log10() +
+  scale_y_log10()
+
+
+
+rank_subset <- freq_by_rank %>% filter(rank <700, rank > 10)
+lm(frequency_term ~ rank, data = rank_subset)
+
+
+freq_by_rank %>% 
+  ggplot(aes(rank, frequency_term, color = rating)) + 
+  geom_abline(intercept = -2.187e-06, slope = 1.178e-03 , color = "gray50", linetype = 2) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+  scale_x_log10() +
+  scale_y_log10()
+
+
+# The bind_tf_idf function ------------------------------------------------
+#Find important words for the content of each document by drecreasing the weight
+#for commonly used words
+
+
+rating_words <- rating_words %>% bind_tf_idf(word, rating, n)
+
+words_tf_idf <- rating_words %>% select (-total) %>% arrange(desc(tf_idf)) %>% filter(n>3)
+
+
+rating_words %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  group_by(rating) %>% 
+  top_n(10) %>% 
+  ungroup() %>%
+  ggplot(aes(x = word, y = tf_idf, fill = rating)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~rating, ncol = 2, scales = "free") +
+  coord_flip()
+
+# Applying algorithms -----------------------------------------------------
+# 1 Tokenizing by n-gram ----------------------------
+
+data_set <- df2 %>% select(author_id, rating, review_)
+
+reviews_bigrams <- data_set %>% 
+  unnest_tokens(bigram, review_, token = 'ngrams', n=2)
+  
+reviews_bigrams
+
+
+# 1.1 Counting and filtering n-grams --------------------------------------
+
+reviews_bigrams %>%
+  count(bigram, sort = TRUE)
+
+#remove stop-words
+bigrams_separated <- reviews_bigrams %>%
+  separate(bigram, c( "word1", "word2"), sep = " ")
+
+bigrams_filtered <- bigrams_separated %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word)
+
+#new bigram counts
+
+bigram_counts <- bigrams_filtered %>%
+  count(word1, word2, sort = TRUE) %>% na.omit()
+
+bigram_counts
+
+
+#united bigrams
+
+bigrams_united <- bigrams_filtered %>%
+  unite(bigram, word1, word2, sep = " ")
+
+bigrams_united
+
+
+# Checking tri-grams
+trigrams_separated <- data_set %>%
+  unnest_tokens(trigram, review_, token = "ngrams", n = 3) %>%
+  separate(trigram, c("word1", "word2", "word3"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word,
+         !word2 %in% stop_words$word,
+         !word3 %in% stop_words$word) %>%
+  count(word1, word2, word3, sort = TRUE) %>%
+  filter(n>1) %>% na.omit()
+trigrams_separated
+
+
+# 1.2 Analysing bigrams -------------------------------------------------------
+
+bigram_tf_idf <- bigrams_united %>%
+  count(rating, bigram) %>%
+  bind_tf_idf(bigram, rating, n) %>%
+  arrange(desc(tf_idf)) %>% filter(n>1)
+
+bigram_tf_idf
+
+
+bigram_tf_idf %>%
+  filter( bigram != 'nhs app') %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(bigram = factor(bigram, levels = rev(unique(bigram)))) %>%
+  group_by(rating) %>% 
+  top_n(5) %>% 
+  ungroup() %>%
+  ggplot(aes(x = bigram, y = tf_idf, fill = rating)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~rating, ncol = 2, scales = "free") +
+  coord_flip()
+
+
+# 1.3 Using bigrams to provide context in sentiment analysis ------------------
+
+bigrams_separated %>%
+  filter(word1 == "not") %>%
+  count(word1, word2, sort = TRUE)
+
+#By performing sentiment analysis on the bigram data, 
+# we can examine how often sentiment-associated words are preceded by ânotâ or other negating words.
+
+#Letâs use the AFINN lexicon for sentiment analysis
+
+AFINN <- get_sentiments('afinn')
+
+AFINN
+
+#We can then examine the most frequent words that were preceded by ânotâ 
+#and were associated with a sentiment.
+
+not_words <- bigrams_separated %>% 
+  filter(word1 == 'not') %>%
+  inner_join(AFINN, by = c(word2 = 'word')) %>%
+  count(word2, value, sort = TRUE)
+
+not_words
+
+
+not_words %>%
+  mutate(contribution = n * value) %>%
+  arrange(desc(abs(contribution))) %>%
+  head(20) %>%
+  mutate(word2 = reorder(word2, contribution)) %>%
+  ggplot(aes(word2, n * value, fill = n * value > 0)) +
+  geom_col(show.legend = FALSE) +
+  xlab("Words preceded by \"not\"") +
+  ylab("Sentiment value * number of occurrences") +
+  coord_flip()
+
+
+# There are more words that provide more context
+
+negation_words <- c("not", "no", "never", "without")
+
+negated_words <- bigrams_separated %>%
+  filter(word1 %in% negation_words) %>%
+  inner_join(AFINN, by = c(word2 = "word")) %>%
+  count(word1, word2, value, sort = TRUE)
+
+
+negated_words %>%
+  mutate(contribution = n * value) %>%
+  arrange(desc(abs(contribution))) %>%
+  head(20) %>%
+  mutate(word2 = reorder(word2, contribution)) %>%
+  ggplot(aes(word2, n * value, fill = n * value > 0)) +
+  geom_col(show.legend = FALSE) +
+  xlab("Words preceded by \"not\"") +
+  ylab("Sentiment value * number of occurrences") +
+  facet_wrap(~word1, ncol = 2, scales = "free") +
+  coord_flip()
+
+
+# 1.4 Visualizing a network of bigrams with ggraph ------------------------
+# We may be interested in visualizing all of the relationships among words simultaneously, 
+# rather than just the top few at a time.
+
+#original counts
+bigram_counts
+
+
+#filter for only relatively common combinations
+#library(igraph)
+bigram_graph <- bigram_counts %>%
+  filter(n > 3) %>%
+  graph_from_data_frame()
+
+bigram_graph
+
+
+#library(ggraph)
+
+a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = a, end_cap = circle(.07, 'inches')) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  theme_void()
+
+
+
+# 1.5 Visualizing bigrams in other texts ----------------------------------
+
+#source('function_bigrams.R')
+
+
+# 2 Counting and correlating pairs of words with th widyr package ---------
+library(widyr)
+
+
+rating_section_words <- data_set %>%
+  filter(rating == '1') %>%
+  mutate(section = row_number() %/% 10) %>%
+  filter(section > 0 ) %>%
+  unnest_tokens(word, review_) %>%
+  filter( !word %in% stop_words$word)
+  
+rating_section_words
+
+word_pairs <- rating_section_words %>%
+  pairwise_count(word, section, sort = TRUE)
+
+word_pairs
+
+word_pairs %>% filter(item2 == 'nhs')
+
+
+# apply the phi coefficient, equivalente to the Pearson correlation, which
+# it is applied to binary data
+
+
+#we need to filter for at least relatively common words first
+
+word_cors <- rating_section_words %>%
+  group_by(word) %>%
+  filter(n() >= 5) %>%
+  pairwise_cor(word,section, sort = TRUE)
+
+word_cors
+
+# analyzing one word
+word_cors %>%
+  filter(item1 %in% c('nhs', 'login', 'registration')) %>%
+  group_by(item1) %>%
+  top_n(6) %>%
+  ungroup() %>%
+  mutate(item2 = reorder(item2, correlation)) %>%
+  ggplot(aes(item2, correlation)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ item1, scales = "free") +
+  coord_flip()
+
+
+#visualize the correlations and clusters of words that were found by the widyr package
+set.seed(2016)
+
+word_cors %>%
+  filter(correlation > .6) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = correlation), show.legend = FALSE , arrow = a) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  theme_void()
+
+
+# STM ---------------------------------------------------------------------
+# STM Structural Topic Modeling (STM)---------------------------------------------------------------------
+# https://cbail.github.io/SICSS_Topic_Modeling.html
+df_stm <- df2 %>% select(author_id, review_, rating)
+
+corpus_df_stm <- df_stm %>%  corpus(text_field = 'review_', docid_field = 'author_id')
+corpus_stats_stm <- summary(corpus_df_stm)
+
+#corpus subset
+corpus_grading <- corpus_subset(corpus_df_stm, rating == '3') #get the topics that each rating generates.
+summary(corpus_grading)
+#create a document-feature matrix
+dfm_df_stm <-dfm(corpus_grading,  #if instead of a corpus subset you want to generate the topics for all the ratings at the same time use corpus_df_stm here instead of corpus_grading 
+                 stem = FALSE,
+                 remove_numbers = FALSE,
+                 remove_punct = TRUE,
+                 remove_separators  = TRUE,
+                 remove_url = TRUE,
+                 tolower = TRUE,
+                 what = 'word',
+                 remove = c(stop_words$word)
+)
+
+mydfm.un.trim_stm <-
+  dfm_trim(
+    dfm_df_stm,
+    min_termfreq = 0.01,
+    min_docfreq = 0.05,
+    # max_docfreq = 0.95,
+    docfreq_type = "prop",
+    termfreq_type = 'prop'
+  ) 
+
+topic.count_stm <- 3 # Assigns the number of topics. You can just play with this number and see if what you get makes sense.
+
+dfm2stm <- convert(mydfm.un.trim_stm, to = "stm")
+
+model.stm <- stm(
+  dfm2stm$documents,
+  dfm2stm$vocab,
+  K = topic.count_stm,
+  data = dfm2stm$meta,
+  init.type = "Spectral"
+)
+
+summary(model.stm)
+data.frame(t(labelTopics(model.stm, n = 5)$prob))
+
+stm.similarity <- as.data.frame(model.stm$beta) %>%
+  scale() %>%
+  dist(method = 'euclidean') %>%
+  hclust(method = 'ward.D2')
+
+plot(stm.similarity, #similarity between topics
+     main = 'STM topic similarity by features',
+     xlab = '',
+     sub = '')
+
+plot(
+  model.stm,
+  type = "summary",
+  # text.cex = 0.5,
+  main = "STM topic shares",
+  xlab = "Share estimation"
+)
+
+
+stm::cloud(model.stm,
+           topic = 1,
+           scale = c(2.25, .5))
+
+
+plot(model.stm, type = "perspectives", topics = c(1,2), 
+     main = "Putting two different topics in perspective")
+
+plot(model.stm, type = "hist", topics = sample(1:topic.count_stm, size = 3))
+
+# Latent Semantic Analysis (LSA)
+#https://www.mzes.uni-mannheim.de/socialsciencedatalab/article/advancing-text-mining/#lsa
+df_lda <- df2
+corpus_df <- df_lda %>%  corpus(text_field = 'review_', docid_field = 'author_id')
+
+
+corpus_stats <- summary(corpus_df)
+
+dfm_df_lda <-dfm(corpus_df,
+                 stem = FALSE,
+                 remove_numbers = FALSE,
+                 remove_punct = TRUE,
+                 remove_separators  = TRUE,
+                 remove_url = TRUE,
+                 tolower = TRUE,
+                 what = 'word',
+                 remove = c(stop_words$word, 'nhs', 'app')
+) %>% dfm_trim(min_docfreq = 0.05,
+                docfreq_type = "prop")
+#LSA
+
+# mylsa <- convert(dfm_df_lda, to = 'lsa')
+mylsa <- textmodel_lsa(dfm_df_lda, nd = 10)
+sources <-
+  str_remove_all(rownames(mylsa$docs), "[0-9///'._txt]") 
+
+sources.color <- rep("gray", times = length(sources))
+# sources.color[sources %in% "1"] <- "blue"
+# sources.color[sources %in% "2"] <- "red"
+# sources.color[sources %in% "3"] <- "green"
+# sources.color[sources %in% "4"] <- "yellow"
+# sources.color[sources %in% "5"] <- "pink"
+
+plot(
+  mylsa$docs[, 1:2],
+  col = alpha(sources.color, 0.3),
+  pch = 19,
+  xlab = "Dimension 1",
+  ylab = "Dimension 2",
+  main = "LSA dimensions by subcorpus"
+)
+
+
+# create an LSA space; return its truncated representation in the low-rank space
+tmod <- textmodel_lsa(dfm_df_lda[1:10, ])
+# matrix in low_rank LSA space
+tmod$matrix_low_rank[, 1:2]
+
+pred <- predict(tmod, newdata = dfm_df_lda[1:10, ])
+pred$docs_newspace
+
+# Unknown categories: Unsupervised machine learning - Latent Dirichlet Allocation (LDA)
+# Both Latent Dirichlet Allocation (LDA) and Structural Topic Modeling (STM) belong to topic modelling. 
+# Topic models find patterns of words that appear together and group them into topics.
+
+df_lda <- df2
+corpus_df <- df_lda %>%  corpus(text_field = 'review_', docid_field = 'author_id')
+
+corpus_stats <- summary(corpus_df)
+
+dfm_df_lda <-dfm(corpus_df,
+                 stem = FALSE,
+                 remove_numbers = FALSE,
+                 remove_punct = TRUE,
+                 remove_separators  = TRUE,
+                 remove_url = TRUE,
+                 tolower = TRUE,
+                 what = 'word',
+                 remove = c(stop_words$word, 'nhs', 'app')
+)
+
+mydfm.un.trim <-
+  dfm_trim(
+    dfm_df_lda,
+    min_docfreq = 0.05,
+    max_docfreq =  0.75,
+    docfreq_type = "prop"
+  ) 
+
+
+# Assign an arbitrary number of topics
+topic.count <- 3
+
+# Convert the trimmed DFM to a topicmodels object
+dfm2topicmodels <- convert(mydfm.un.trim, to = "topicmodels")
+
+
+lda.model <- LDA(dfm2topicmodels, k = topic.count, method = 'VEM', contrl = NULL)
+lda.model
+
+
+lda.similarity <- as.data.frame(lda.model@beta) %>%
+  scale() %>%
+  dist(method = "euclidean") %>%
+  hclust(method = "ward.D2")
+
+par(mar = c(0, 4, 4, 2))
+
+plot(lda.similarity,
+     main = "LDA topic similarity by features",
+     xlab = "",
+     sub = "")
+as.data.frame(terms(lda.model, 6))
+
+
+#Extract LDA function to create a LDA model with K topics
+text_topics <- tidy(lda.model, matrix ='beta')
+
+text_top_terms <- text_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+text_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+
+# A slightly diffferent appraoch is to determine the terms that  --------
+#the greatest difference in Beta between Group 1 and Group 2 by calculating log2(beta2/beta1).
+
+# beta_spread <- text_topics %>%
+#   mutate(topic = paste0("topic", topic)) %>%
+#   spread(topic, beta) %>%
+#   filter(topic1 > .001 | topic2 > .001) %>%
+#   mutate(log_ratio = log2(topic2 / topic1))
+# 
+# beta_spread
+# 
+# beta_spread %>%
+#   group_by(direction = log_ratio > 0) %>%
+#   top_n(15, abs(log_ratio)) %>%
+#   ungroup() %>%
+#   mutate(term = reorder(term, log_ratio)) %>%
+#   ggplot(aes(term, log_ratio)) +
+#   geom_col() +
+#   labs(y = "Log2 ratio of beta in topic 2 / topic 1") +
+#   coord_flip()
+
+
+#NAIVE BAYES CLASSIFIER
+set.seed(7)
+df_nbc <- df2 %>% filter(wordcount > 13)
+
+
+# corpus ------------------------------------------------------------------
+
+df_nbc_corpus <- df_nbc %>% corpus (text_field = 'review_', docid_field = 'author_id') 
+
+
+# convert to dfm ----------------------------------------------------------
+
+df_dfm <- dfm(df_nbc_corpus,
+              remove_numbers = TRUE,
+              remove_punct = TRUE,
+              remove_separators  = TRUE,
+              remove_url = TRUE,
+              remove_symbols = TRUE,
+              split_hyphens = TRUE,
+              include_docvars = TRUE,
+              what = 'word',
+              remove = c(stop_words$word, 'app'))  %>%
+      dfm_trim(
+               min_termfreq = 5,
+               termfreq_type = 'count',
+               min_docfreq = 5,
+               docfreq_type = 'count'
+      ) %>% dfm_tfidf()
+
+
+# training and test set ---------------------------------------------------
+
+smp_size_nbc <-  floor(0.75 * nrow(df_dfm))
+train_ind <- sample(seq_len(nrow(df_dfm)), size = smp_size_nbc)
+train_nbc <- df_dfm[train_ind, ]
+test_nbc <- df_dfm[-train_ind, ]
+
+
+# run NBC -----------------------------------------------------------------
+
+tmod_nb <- textmodel_nb(train_nbc, train_nbc$rating)
+summary(tmod_nb)
+
+
+dfmat_matched <- dfm_match(test_nbc, features = featnames(train_nbc))
+
+# confusion matrix --------------------------------------------------------
+
+actual_class <- dfmat_matched$rating
+predicted_class <- predict(tmod_nb, newdata = dfmat_matched)
+
+confusionMatrix(predicted_class, actual_class)
+
+
+
+
